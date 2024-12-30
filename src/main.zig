@@ -1,35 +1,27 @@
 const std = @import("std");
-const net = std.net;
-const Address = net.Address;
+const Server = @import("http/server.zig").Server;
+const Request = @import("http/request.zig").Request;
+const Response = @import("http/response.zig").Response;
+pub fn handler(req: *Request, res: *Response) !void {
+    std.debug.print("HNADLER RECEIVED FUNCTION \n", .{});
+    if (std.mem.eql(u8, req.path(), "/")) {
+        try res.text("Hello, World! \n");
+    } else {
+        res.status = .not_found;
+        try res.text("Not Found");
+    }
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    //    const allocator = gpa.allocator();
+    const allocator = gpa.allocator();
 
-    var read_buffer: [8192]u8 = undefined;
-    const address = try Address.parseIp("127.0.0.1", 8080);
-
-    var tcp_server = try address.listen(.{
-        .reuse_address = true,
+    var server = try Server.init(allocator, .{
+        .port = 8080,
+        .hostname = "127.0.0.1",
     });
-    defer tcp_server.deinit();
+    defer server.deinit();
 
-    std.debug.print("Server listening on {}\n", .{tcp_server.listen_address});
-
-    while (true) {
-        const connection = try tcp_server.accept();
-        defer connection.stream.close();
-
-        var http_server = std.http.Server.init(connection, &read_buffer);
-
-        const request = try http_server.receiveHead();
-        std.debug.print("{s} request from {s}\n", .{ @tagName(request.head.method), request.head.target });
-
-        const status_line = "HTTP/1.1 200 OK\r\n";
-        const headers = "Content-Type: text/plain\r\nContent-Length: 25\r\n\r\n";
-        try connection.stream.writeAll(status_line);
-        try connection.stream.writeAll(headers);
-        try connection.stream.writeAll("Hello from Zig HTTP Server!\n");
-    }
+    try server.start(handler);
 }
