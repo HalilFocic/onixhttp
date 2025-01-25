@@ -1,40 +1,38 @@
+// Multithreaded server with a ThreadPool
 const std = @import("std");
 const net = std.net;
 const posix = std.posix;
-
+const log = std.log;
+const Allocator = std.mem.Allocator;
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    var pool: std.Thread.Pool = undefined;
-    try std.Thread.Pool.init(&pool, .{ .allocator = allocator, .n_jobs = 64 });
+    var server = try Server.init(allocator, 4096);
+    defer server.deinit();
 
     const address = try std.net.Address.parseIp("127.0.0.1", 8000);
-    const tpe: u32 = posix.SOCK.STREAM;
-    const protocol = posix.IPPROTO.TCP;
-    const listener = try posix.socket(address.any.family, tpe, protocol);
-    defer posix.close(listener);
-
-    try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try posix.bind(listener, &address.any, address.getOsSockLen());
-    try posix.listen(listener, 128);
-
-    while (true) {
-        var client_address: net.Address = undefined;
-        var client_address_len: posix.socklen_t = @sizeOf(net.Address);
-        const socket = posix.accept(listener, &client_address.any, &client_address_len, 0) catch |err| {
-            std.debug.print("error accept: {}\n", .{err});
-            continue;
-        };
-
-        const client = Client{ .socket = socket, .address = client_address };
-        try pool.spawn(Client.handle, .{client});
-    }
+    try server.run(address);
 }
 
 const Client = struct {
     socket: posix.socket_t,
     address: std.net.Address,
+    reader: Reader,
+
+    fn init(allocator: Allocator, socket: posix.socket_t, address: std.net.Address) !Client {
+        const reader = try Reader.init(allocator, 4096);
+        errdefer reader.deinit(allocator);
+        return .{
+            .reader = reader,
+            .socket = socket,
+            .address = address,
+        };
+    }
+
+    fn deinit(self: *const Client, allocator: Allocator) void {
+        self.reader.deinit(allocator);
+    }
 
     fn handle(self: Client) void {
         defer posix.close(self.socket);
@@ -61,15 +59,34 @@ const Client = struct {
             std.debug.print("[{}] sent: {s}\n", .{ self.address, msg });
         }
     }
+
+    fn readMessage(self: *Client) !?[]const u8 {
+        return self.reader.readMessage(self.socket) catch |err| switch (err) {
+            error.WouldBlock => null,
+            else => return err,
+        };
+    }
 };
 
 const Reader = struct {
     buf: []u8,
     pos: usize = 0,
     start: usize = 0,
-    socket: posix.socket_t,
 
-    fn readMessage(self: *Reader) ![]u8 {
+    fn init(allocator: Allocator, size: usize) !Reader {
+        const buf = try allocator.alloc(u8, size);
+        return .{
+            .pos = 0,
+            .start = 0,
+            .buf = buf,
+        };
+    }
+
+    fn deinit(self: *const Reader, allocator: Allocator) void {
+        allocator.free(self.buf);
+    }
+
+    fn readMessage(self: *Reader, socket: posix.socket_t) ![]u8 {
         var buf = self.buf;
 
         while (true) {
@@ -77,7 +94,7 @@ const Reader = struct {
                 return msg;
             }
             const pos = self.pos;
-            const n = try posix.read(self.socket, buf[pos..]);
+            const n = try posix.read(socket, buf[pos..]);
             if (n == 0) {
                 return error.Closed;
             }
@@ -127,5 +144,118 @@ const Reader = struct {
         std.mem.copyForwards(u8, buf[0..unprocessed.len], unprocessed);
         self.start = 0;
         self.pos = unprocessed.len;
+    }
+};
+
+const Server = struct {
+    allocator: Allocator,
+    connected: usize,
+    polls: []posix.pollfd,
+    clients: []Client,
+    client_polls: []posix.pollfd,
+
+    fn init(allocator: Allocator, max: usize) !Server {
+        const polls = try allocator.alloc(posix.pollfd, max + 1); // <== Plus one is because of listening socket
+        errdefer allocator.free(polls);
+
+        const clients = try allocator.alloc(Client, max);
+        errdefer allocator.free(clients);
+
+        return .{
+            .polls = polls,
+            .clients = clients,
+            .client_polls = polls[1..],
+            .connected = 0,
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: *Server) void {
+        self.allocator.free(self.clients);
+        self.allocator.free(self.polls);
+    }
+
+    fn run(self: *Server, address: std.net.Address) !void {
+        const tpe: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
+        const protocol = posix.IPPROTO.TCP;
+        const listener = try posix.socket(address.any.family, tpe, protocol);
+        defer posix.close(listener);
+
+        try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+        try posix.bind(listener, &address.any, address.getOsSockLen());
+        try posix.listen(listener, 128);
+
+        self.polls[0] = .{
+            .fd = listener,
+            .revents = 0,
+            .events = posix.POLL.IN,
+        };
+
+        while (true) {
+            _ = try posix.poll(self.polls[0 .. self.connected + 1], -1);
+
+            if (self.polls[0].revents != 0) {
+                self.accept(listener) catch |err| log.err("failed to accept: {} \n", .{err});
+            }
+
+            var i: usize = 0;
+            while (i < self.connected) {
+                const revents = self.client_polls[i].revents;
+                if (revents == 0) {
+                    i += 1;
+                    continue;
+                }
+
+                var client = self.clients[i];
+                if (revents & posix.POLL.IN == posix.POLL.IN) {
+                    while (true) {
+                        const msg = client.readMessage() catch {
+                            self.removeClient(i);
+                            break;
+                        } orelse {
+                            i += 1;
+                            break;
+                        };
+                        std.debug.print("got: {s}\n", .{msg});
+                    }
+                }
+            }
+        }
+    }
+
+    fn accept(self: *Server, listener: posix.socket_t) !void {
+        while (true) {
+            var address: std.net.Address = undefined;
+            var address_len: posix.socklen_t = @sizeOf(net.Address);
+            const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.NONBLOCK) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => break,
+            };
+            const client = Client.init(self.allocator, socket, address) catch |err| {
+                posix.close(socket);
+                log.err("failed to initalize client: {}", .{err});
+                return;
+            };
+
+            const connected = self.connected;
+            self.clients[connected] = client;
+            self.client_polls[connected] = .{
+                .fd = socket,
+                .revents = 0,
+                .events = posix.POLL.IN,
+            };
+            self.connected = connected + 1;
+        }
+    }
+
+    fn removeClient(self: *Server, at: usize) void {
+        var client = self.clients[at];
+        posix.close(client.socket);
+        client.deinit(self.allocator);
+
+        const last_index = self.connected - 1;
+        self.clients[at] = self.clients[last_index];
+        self.client_polls[at] = self.client_polls[last_index];
+        self.connected = last_index;
     }
 };
